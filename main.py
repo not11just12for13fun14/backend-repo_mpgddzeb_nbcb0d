@@ -10,7 +10,7 @@ from dotenv import load_dotenv, find_dotenv
 _ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(find_dotenv(_ENV_PATH) or _ENV_PATH, override=True)
 
-app = FastAPI(title="ReplyRate Backend", version="1.1.1")
+app = FastAPI(title="ReplyRate Backend", version="1.1.2")
 
 # CORS: allow all for dev preview
 app.add_middleware(
@@ -44,6 +44,68 @@ def read_root():
     return {"message": "ReplyRate Backend is running"}
 
 
+def _call_openai_json(api_key: str, system: str, user: str) -> dict:
+    """Call OpenAI trying JSON mode; gracefully fall back if not supported.
+
+    This handles environments where the installed openai package/model combo
+    doesn't accept the `response_format` argument by retrying without it and
+    then extracting the first JSON object from the text.
+    """
+    from openai import OpenAI  # type: ignore
+    import json
+    import re
+
+    client = OpenAI(api_key=api_key)
+
+    def parse_json_strict(text: str) -> dict:
+        obj = json.loads((text or "").strip())
+        if not isinstance(obj, dict):
+            raise ValueError("OpenAI response not a JSON object")
+        return obj
+
+    # First attempt: JSON mode via response_format
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+        content = (completion.choices[0].message.content or "").strip()
+        return parse_json_strict(content)
+    except TypeError:
+        # Older SDK that doesn't accept response_format
+        pass
+
+    # Fallback attempt: no response_format, but instruct strict JSON
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You evaluate cold outreach for likelihood of a positive reply. "
+                    "Respond ONLY with a compact JSON object (no prose) with keys: "
+                    "score (integer 0-100), reasons (array of 2-6 short strings), improved (string)."
+                ),
+            },
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+    )
+    content = (completion.choices[0].message.content or "").strip()
+
+    # Extract first {...} block to guard against wrappers like ```json
+    match = re.search(r"\{[\s\S]*\}", content)
+    if not match:
+        raise ValueError("OpenAI did not return JSON")
+
+    return parse_json_strict(match.group(0))
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
     msg = req.message.strip()
@@ -56,11 +118,6 @@ async def analyze(req: AnalyzeRequest):
     # If OpenAI errors, we return a 502 to signal the client instead of falling back.
     if api_key:
         try:
-            from openai import OpenAI  # type: ignore
-            import json
-
-            client = OpenAI(api_key=api_key)
-
             system = (
                 "You evaluate cold outreach for likelihood of a positive reply. "
                 "Respond ONLY as a strict JSON object with fields: "
@@ -72,25 +129,7 @@ async def analyze(req: AnalyzeRequest):
                 f"Message: " + msg
             )
 
-            # Use Chat Completions API for maximum compatibility; request JSON output
-            completion = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-
-            content = (completion.choices[0].message.content or "").strip()
-            if not content:
-                raise ValueError("Empty response from OpenAI")
-
-            parsed = json.loads(content)
-
-            if not isinstance(parsed, dict):
-                raise ValueError("OpenAI response not a JSON object")
+            parsed = _call_openai_json(api_key=api_key, system=system, user=user)
 
             # Validate score
             raw_score = parsed.get("score")
