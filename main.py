@@ -10,7 +10,7 @@ from dotenv import load_dotenv, find_dotenv
 _ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(find_dotenv(_ENV_PATH) or _ENV_PATH, override=True)
 
-app = FastAPI(title="ReplyRate Backend", version="1.0.0")
+app = FastAPI(title="ReplyRate Backend", version="1.1.0")
 
 # CORS: allow all for dev preview
 app.add_middleware(
@@ -52,20 +52,24 @@ async def analyze(req: AnalyzeRequest):
 
     api_key = os.getenv("OPENAI_API_KEY")
 
-    # Try real OpenAI if key present; otherwise, return a heuristic fallback
+    # If an API key is present, we always use OpenAI for ALL fields (score, reasons, improved).
+    # If OpenAI errors, we return a 502 to signal the client instead of falling back.
     if api_key:
         try:
             from openai import OpenAI  # type: ignore
+            import json
 
             client = OpenAI(api_key=api_key)
 
             system = (
-                "You rate outreach messages for likelihood of a positive reply. "
-                "Return a JSON object with fields: score (0-100 integer), reasons (array of short strings), improved (concise improved message)."
+                "You evaluate cold outreach for likelihood of a positive reply. "
+                "Respond ONLY as a strict JSON object with fields: "
+                "score (integer 0-100), reasons (array of 2-6 short strings), improved (string). "
+                "Be specific, concise, and actionable."
             )
             user = (
-                "Analyze this outreach message for reply probability. "
-                "Be candid and specific. Message: " + msg
+                "Analyze this outreach message and produce a JSON object as specified.\n\n"
+                f"Message: " + msg
             )
 
             response = client.responses.create(
@@ -78,23 +82,37 @@ async def analyze(req: AnalyzeRequest):
             )
 
             content = response.output_text
-            import json
-
             parsed = json.loads(content)
 
-            score = int(max(0, min(100, int(parsed.get("score", 68)))))
-            reasons = parsed.get("reasons", []) or []
-            improved = parsed.get("improved", "") or ""
+            if not isinstance(parsed, dict):
+                raise ValueError("OpenAI response not a JSON object")
 
-            if not isinstance(reasons, list):
-                reasons = [str(reasons)] if reasons else []
+            # Validate score
+            raw_score = parsed.get("score")
+            if raw_score is None:
+                raise ValueError("Missing 'score' in OpenAI response")
+            try:
+                score = int(raw_score)
+            except Exception:
+                raise ValueError("Non-integer 'score' in OpenAI response")
+            score = max(0, min(100, score))
+
+            # Validate reasons
+            reasons = parsed.get("reasons")
+            if not isinstance(reasons, list) or not all(isinstance(r, str) for r in reasons):
+                raise ValueError("'reasons' must be an array of strings")
+
+            # Validate improved
+            improved = parsed.get("improved")
+            if not isinstance(improved, str) or not improved.strip():
+                raise ValueError("'improved' must be a non-empty string")
 
             return AnalyzeResponse(score=score, reasons=reasons, improved=improved)
-        except Exception:
-            # Fall through to heuristic fallback on any error
-            pass
+        except Exception as e:
+            # With a key present, we do NOT fall back to heuristic; surface an error
+            raise HTTPException(status_code=502, detail=f"OpenAI_error: {str(e)}")
 
-    # Heuristic fallback when no key or on error
+    # No API key present: provide heuristic fallback so the UI remains usable
     lower = msg.lower()
     score = 75
     reasons: List[str] = []
