@@ -10,7 +10,7 @@ from dotenv import load_dotenv, find_dotenv
 _ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(find_dotenv(_ENV_PATH) or _ENV_PATH, override=True)
 
-app = FastAPI(title="ReplyRate Backend", version="1.1.0")
+app = FastAPI(title="ReplyRate Backend", version="1.1.1")
 
 # CORS: allow all for dev preview
 app.add_middleware(
@@ -72,16 +72,21 @@ async def analyze(req: AnalyzeRequest):
                 f"Message: " + msg
             )
 
-            response = client.responses.create(
+            # Use Chat Completions API for maximum compatibility; request JSON output
+            completion = client.chat.completions.create(
                 model="gpt-4o-mini",
-                input=[
+                messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
                 response_format={"type": "json_object"},
+                temperature=0.2,
             )
 
-            content = response.output_text
+            content = (completion.choices[0].message.content or "").strip()
+            if not content:
+                raise ValueError("Empty response from OpenAI")
+
             parsed = json.loads(content)
 
             if not isinstance(parsed, dict):
