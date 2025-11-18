@@ -1,9 +1,14 @@
 import os
-from typing import List, Optional
+from typing import List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv, find_dotenv
+
+# Load environment variables from a known .env path next to this file
+_ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(find_dotenv(_ENV_PATH) or _ENV_PATH, override=True)
 
 app = FastAPI(title="ReplyRate Backend", version="1.0.0")
 
@@ -29,7 +34,9 @@ class AnalyzeResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    # Expose minimal signal that env was picked up (without leaking secrets)
+    has_key = bool(os.getenv("OPENAI_API_KEY"))
+    return {"status": "ok", "openai": "set" if has_key else "missing"}
 
 
 @app.get("/")
@@ -48,7 +55,6 @@ async def analyze(req: AnalyzeRequest):
     # Try real OpenAI if key present; otherwise, return a heuristic fallback
     if api_key:
         try:
-            # Lazy import so the app still runs without the package installed
             from openai import OpenAI  # type: ignore
 
             client = OpenAI(api_key=api_key)
@@ -62,7 +68,6 @@ async def analyze(req: AnalyzeRequest):
                 "Be candid and specific. Message: " + msg
             )
 
-            # Use the Responses API with JSON output
             response = client.responses.create(
                 model="gpt-4o-mini",
                 input=[
@@ -72,7 +77,6 @@ async def analyze(req: AnalyzeRequest):
                 response_format={"type": "json_object"},
             )
 
-            # Extract JSON text from the first output
             content = response.output_text
             import json
 
@@ -82,7 +86,6 @@ async def analyze(req: AnalyzeRequest):
             reasons = parsed.get("reasons", []) or []
             improved = parsed.get("improved", "") or ""
 
-            # Basic fallbacks if model returns unexpected structure
             if not isinstance(reasons, list):
                 reasons = [str(reasons)] if reasons else []
 
@@ -128,47 +131,6 @@ async def analyze(req: AnalyzeRequest):
         ]
 
     return AnalyzeResponse(score=score, reasons=reasons, improved=improved)
-
-
-# Optional: existing database connectivity test (kept for convenience)
-@app.get("/test")
-def test_database():
-    response = {
-        "backend": "✅ Running",
-        "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
-        "connection_status": "Not Connected",
-        "collections": [],
-    }
-
-    try:
-        from database import db  # type: ignore
-
-        if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = getattr(db, "name", "✅ Connected")
-            response["connection_status"] = "Connected"
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-
-    except ImportError:
-        response["database"] = "❌ Database module not found (optional)"
-    except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-
-    # Env markers
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-
-    return response
 
 
 if __name__ == "__main__":
